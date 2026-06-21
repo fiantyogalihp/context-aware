@@ -45,6 +45,7 @@ def main():
     for chunk in chunks:
         assert chunk.get("source"), f"chunk {chunk.get('chunk_id')} missing source"
         assert isinstance(chunk.get("metadata"), dict), f"chunk {chunk.get('chunk_id')} missing metadata object"
+        assert chunk["metadata"].get("chunk_type") in {"text", "table"}, f"chunk {chunk.get('chunk_id')} missing metadata.chunk_type"
         assert chunk.get("content"), f"chunk {chunk.get('chunk_id')} missing content"
     chunk_ids = {c["chunk_id"] for c in chunks}
     for q in qas:

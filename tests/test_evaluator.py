@@ -7,7 +7,7 @@ from src.evaluator import evaluate
 from src.evaluator import load_thresholds
 from src.generator import XiaomiMimoClient
 from src.hybrid_retriever import expand_query, prune_context, reciprocal_rank_fusion
-from src.parser import build_chunks, table_to_text
+from src.parser import build_chunks, table_to_markdown, table_to_text
 
 def read_jsonl(path):
     with open(path, encoding="utf-8") as f:
@@ -125,6 +125,16 @@ def test_table_to_text_preserves_relational_cells():
     assert "Restriksi: sesuai Fornas" in text
 
 
+def test_table_to_markdown_preserves_columns():
+    table = [
+        ["Nama Obat", "Bentuk", "Restriksi"],
+        ["Amoksisilin", "kapsul 500 mg", "sesuai Fornas"],
+    ]
+    markdown = table_to_markdown(table)
+    assert "| Nama Obat | Bentuk | Restriksi |" in markdown
+    assert "| Amoksisilin | kapsul 500 mg | sesuai Fornas |" in markdown
+
+
 def test_build_chunks_emits_canonical_schema_and_legacy_fields():
     chunks = build_chunks([{
         "doc_id": "DOC1",
@@ -134,6 +144,27 @@ def test_build_chunks_emits_canonical_schema_and_legacy_fields():
         "content": "Panduan Layanan\nIsi panduan resmi.",
     }])
     assert chunks[0]["source"] == "Dokumen Resmi"
-    assert chunks[0]["metadata"] == {"page": 3, "section": "Panduan Layanan", "subsection": "Panduan Layanan"}
+    assert chunks[0]["metadata"] == {
+        "page": 3,
+        "section": "Panduan Layanan",
+        "subsection": "Panduan Layanan",
+        "chunk_type": "text",
+    }
     assert chunks[0]["content"] == chunks[0]["text"]
     assert chunks[0]["section"] == "Panduan Layanan"
+
+
+def test_build_chunks_marks_table_chunks():
+    chunks = build_chunks([{
+        "doc_id": "FORNAS",
+        "title": "Formularium Nasional",
+        "page": 7,
+        "section": "Tabel 1 halaman 7",
+        "subtitle": "Tabel 1",
+        "chunk_type": "table",
+        "table_index": 1,
+        "content": "| Nama Obat | Bentuk |\n| --- | --- |\n| Amoksisilin | kapsul 500 mg |",
+    }])
+    assert chunks[0]["chunk_type"] == "table"
+    assert chunks[0]["metadata"]["chunk_type"] == "table"
+    assert chunks[0]["metadata"]["table_index"] == 1

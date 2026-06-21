@@ -40,6 +40,12 @@ UPPER_HEADING_RE = re.compile(r"^[A-Z0-9 ,/()\-]{8,}$")
 
 TABLE_NOISE_RE = re.compile(r"^[\s|:/\\._\-–—•·]+$")
 
+TABLE_SETTINGS = {
+    "vertical_strategy": "lines",
+    "horizontal_strategy": "lines",
+    "intersection_tolerance": 5,
+}
+
 
 def clean_text(text: str) -> str:
     text = re.sub(r"\r", "\n", text or "")
@@ -103,9 +109,14 @@ def normalize_table_row(row: Sequence[object]) -> List[str]:
     return [clean_text(str(cell or "")) for cell in row]
 
 
+def normalize_table(table: Sequence[Sequence[object]]) -> List[List[str]]:
+    rows = [normalize_table_row(row) for row in table]
+    return [row for row in rows if any(cell and not TABLE_NOISE_RE.fullmatch(cell) for cell in row)]
+
+
 def infer_table_headers(table: Sequence[Sequence[object]]) -> tuple[List[str], int]:
     """Return usable headers and the first data-row index for a PDF table."""
-    rows = [normalize_table_row(row) for row in table]
+    rows = normalize_table(table)
     width = max((len(row) for row in rows), default=0)
     if width == 0:
         return [], 0
@@ -122,10 +133,33 @@ def infer_table_headers(table: Sequence[Sequence[object]]) -> tuple[List[str], i
     return [f"col_{idx + 1}" for idx in range(width)], 0
 
 
+def markdown_escape(cell: str) -> str:
+    return clean_text(cell).replace("|", "\\|").replace("\n", "<br>")
+
+
+def table_to_markdown(table: Sequence[Sequence[object]]) -> str:
+    """Serialize a PDF table as Markdown while preserving column alignment."""
+    rows = normalize_table(table)
+    if not rows:
+        return ""
+    headers, start_idx = infer_table_headers(rows)
+    width = max(len(headers), max((len(row) for row in rows), default=0))
+    headers = (headers + [f"col_{idx + 1}" for idx in range(len(headers), width)])[:width]
+    body_rows = rows[start_idx:] if start_idx < len(rows) else rows
+
+    header_line = "| " + " | ".join(markdown_escape(header or f"col_{idx + 1}") for idx, header in enumerate(headers)) + " |"
+    divider = "| " + " | ".join("---" for _ in headers) + " |"
+    body = []
+    for row in body_rows:
+        cells = (list(row) + [""] * width)[:width]
+        if any(cell and not TABLE_NOISE_RE.fullmatch(cell) for cell in cells):
+            body.append("| " + " | ".join(markdown_escape(cell) for cell in cells) + " |")
+    return "\n".join([header_line, divider, *body]) if body else ""
+
+
 def table_to_text(table: Sequence[Sequence[object]]) -> str:
     """Serialize a relational PDF table as one key-value line per data row."""
-    rows = [normalize_table_row(row) for row in table]
-    rows = [row for row in rows if any(cell for cell in row)]
+    rows = normalize_table(table)
     if not rows:
         return ""
 
@@ -143,27 +177,65 @@ def table_to_text(table: Sequence[Sequence[object]]) -> str:
     return "\n".join(serialized)
 
 
-def extract_pdf_with_pdfplumber(path: Path) -> Iterator[tuple[int, str]]:
+def table_to_structured_text(table: Sequence[Sequence[object]]) -> str:
+    """Return Markdown plus row-level key-value text for reliable retrieval."""
+    markdown = table_to_markdown(table)
+    row_text = table_to_text(table)
+    return clean_text("\n".join(part for part in (markdown, row_text) if part))
+
+
+def extract_page_tables(page) -> List[Dict]:
+    """Extract relational tables from a pdfplumber page with a robust fallback."""
+    tables = page.extract_tables(TABLE_SETTINGS) or []
+    if not tables:
+        tables = page.extract_tables() or []
+
+    extracted: List[Dict] = []
+    seen: set[str] = set()
+    for table_i, table in enumerate(tables, start=1):
+        content = table_to_structured_text(table)
+        if not content:
+            continue
+        key = re.sub(r"\s+", " ", content.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        extracted.append({"table_index": table_i, "content": content})
+    return extracted
+
+
+def extract_pdf_elements_with_pdfplumber(path: Path) -> Iterator[Dict]:
     if pdfplumber is None:
         raise RuntimeError("pdfplumber is required for primary PDF extraction")
     with pdfplumber.open(str(path)) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
             page_text = clean_text(page.extract_text(x_tolerance=1, y_tolerance=3) or "")
-            parts = [page_text]
-            tables = page.extract_tables({
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-                "intersection_tolerance": 5,
-            }) or []
-            if not tables:
-                tables = page.extract_tables() or []
-            for table_i, table in enumerate(tables, start=1):
-                table_text = table_to_text(table)
-                if table_text:
-                    parts.append(f"Tabel {table_i} halaman {page_no}\n{table_text}")
-            text = clean_text("\n\n".join(p for p in parts if p))
-            if text:
-                yield page_no, text
+            if page_text:
+                yield {
+                    "page": page_no,
+                    "section": None,
+                    "subtitle": None,
+                    "chunk_type": "text",
+                    "text": page_text,
+                    "content": page_text,
+                }
+            for table in extract_page_tables(page):
+                table_i = table["table_index"]
+                content = f"Tabel {table_i} halaman {page_no}\n{table['content']}"
+                yield {
+                    "page": page_no,
+                    "section": f"Tabel {table_i} halaman {page_no}",
+                    "subtitle": f"Tabel {table_i}",
+                    "chunk_type": "table",
+                    "table_index": table_i,
+                    "text": content,
+                    "content": content,
+                }
+
+
+def extract_pdf_with_pdfplumber(path: Path) -> Iterator[tuple[int, str]]:
+    for element in extract_pdf_elements_with_pdfplumber(path):
+        yield int(element["page"]), str(element["content"])
 
 
 def extract_pdf_with_pypdf(path: Path) -> Iterator[tuple[int, str]]:
@@ -176,11 +248,31 @@ def extract_pdf_with_pypdf(path: Path) -> Iterator[tuple[int, str]]:
             yield page_no, text
 
 
+def extract_pdf_elements_with_pypdf(path: Path) -> Iterator[Dict]:
+    for page_no, text in extract_pdf_with_pypdf(path):
+        yield {
+            "page": page_no,
+            "section": None,
+            "subtitle": None,
+            "chunk_type": "text",
+            "text": text,
+            "content": text,
+        }
+
+
 def extract_pdf(path: Path) -> Iterator[tuple[int, str]]:
     if pdfplumber is not None:
         yield from extract_pdf_with_pdfplumber(path)
         return
     yield from extract_pdf_with_pypdf(path)
+
+
+def extract_pdf_elements(path: Path) -> Iterator[Dict]:
+    """Yield separate text and table elements for clean downstream chunking."""
+    if pdfplumber is not None:
+        yield from extract_pdf_elements_with_pdfplumber(path)
+        return
+    yield from extract_pdf_elements_with_pypdf(path)
 
 
 def extract_documents_from_catalog(catalog_path: Path, root: Path) -> List[Dict]:
@@ -195,19 +287,19 @@ def extract_documents_from_catalog(catalog_path: Path, root: Path) -> List[Dict]
             kind = sniff_kind(path)
             if kind == "html":
                 text = extract_html(path)
-                docs.append({**common, "page": None, "section": None, "subtitle": None, "text": text, "content": text})
+                docs.append({**common, "page": None, "section": None, "subtitle": None, "chunk_type": "text", "text": text, "content": text})
             elif kind == "pdf":
                 try:
-                    for page_no, text in extract_pdf(path):
-                        docs.append({**common, "page": page_no, "section": None, "subtitle": None, "text": text, "content": text})
+                    for element in extract_pdf_elements(path):
+                        docs.append({**common, **element})
                 except Exception as exc:
                     print(f"PDF parse failed, falling back to HTML/text for {path}: {exc}", file=sys.stderr)
                     raw = path.read_text(encoding="utf-8", errors="ignore")
                     text = extract_html(path) if "<html" in raw.lower() or "<!doctype" in raw.lower() else clean_text(raw)
-                    docs.append({**common, "page": None, "section": None, "subtitle": None, "text": text, "content": text})
+                    docs.append({**common, "page": None, "section": None, "subtitle": None, "chunk_type": "text", "text": text, "content": text})
             else:
                 text = clean_text(path.read_text(encoding="utf-8", errors="ignore"))
-                docs.append({**common, "page": None, "section": None, "subtitle": None, "text": text, "content": text})
+                docs.append({**common, "page": None, "section": None, "subtitle": None, "chunk_type": "text", "text": text, "content": text})
         except Exception as exc:
             print(f"FAILED extraction {path}: {exc}", file=sys.stderr)
     return docs
@@ -280,9 +372,10 @@ def build_chunks(documents: Sequence[Dict], *, max_words: int = 220, overlap: in
         title = doc.get("title") or doc.get("doc_id")
         page = doc.get("page")
         default_section = base_section(doc)
+        chunk_type = str(doc.get("chunk_type") or "text")
         source_text = str(doc.get("content") or doc.get("text") or "")
-        if doc.get("section"):
-            detected_sections = [(str(doc["section"]), source_text)]
+        if chunk_type == "table" or doc.get("section"):
+            detected_sections = [(str(doc.get("section") or default_section), source_text)]
         else:
             detected_sections = split_by_headings(source_text)
         for detected_section, section_text in detected_sections:
@@ -299,12 +392,16 @@ def build_chunks(documents: Sequence[Dict], *, max_words: int = 220, overlap: in
                     chunk_id = f"{doc.get('doc_id')}_{norm_id(section)}_{doc_i:03d}"
                 else:
                     chunk_id = f"{doc.get('doc_id')}_{norm_id(section)}_{doc_i:04d}_{part_i:02d}"
-                metadata = {"page": page, "section": section, "subsection": subtitle}
+                metadata = {"page": page, "section": section, "subsection": subtitle, "chunk_type": chunk_type}
+                if doc.get("table_index") is not None:
+                    metadata["table_index"] = doc.get("table_index")
                 chunks.append({
                     "chunk_id": chunk_id,
                     "doc_id": doc.get("doc_id"),
                     "source": chunk_source(doc),
                     "metadata": metadata,
+                    "chunk_type": chunk_type,
+                    "table_index": doc.get("table_index"),
                     "title": title,
                     "subtitle": subtitle,
                     "section": section,

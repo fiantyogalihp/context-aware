@@ -2,6 +2,7 @@
 """Build hierarchy-preserving chunks from extracted or starter documents."""
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -16,12 +17,28 @@ OUT = ROOT / "dataset" / "processed" / "chunks.jsonl"
 LEGACY_OUT = ROOT / "dataset" / "processed" / "chunks_rebuilt.jsonl"
 
 
+def select_source(source: str) -> Path:
+    if source == "starter":
+        return STARTER
+    if source == "extracted":
+        return EXTRACTED
+    return EXTRACTED if EXTRACTED.exists() and EXTRACTED.stat().st_size > 0 else STARTER
+
+
 def main() -> int:
-    src = EXTRACTED if EXTRACTED.exists() and EXTRACTED.stat().st_size > 0 else STARTER
+    parser = argparse.ArgumentParser(description="Build hierarchy-preserving JSONL chunks.")
+    parser.add_argument("--source", choices=["auto", "starter", "extracted"], default="auto")
+    parser.add_argument("--out", type=Path, default=OUT)
+    parser.add_argument("--legacy-out", type=Path, default=LEGACY_OUT)
+    args = parser.parse_args()
+
+    src = select_source(args.source)
+    if not src.exists() or src.stat().st_size == 0:
+        raise FileNotFoundError(f"Chunk source is missing or empty: {src}")
     chunks = build_chunks(read_jsonl(src))
-    write_jsonl(OUT, chunks)
-    write_jsonl(LEGACY_OUT, chunks)
-    print(f"Wrote {len(chunks)} chunks to {OUT}")
+    write_jsonl(args.out, chunks)
+    write_jsonl(args.legacy_out, chunks)
+    print(f"Wrote {len(chunks)} chunks from {src} to {args.out}")
     return 0
 
 

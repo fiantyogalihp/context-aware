@@ -224,17 +224,40 @@ class HybridRetriever:
         self.build_index(recreate=True)
         return self._embeddings
 
-    def bm25_ranks(self, query: str, limit: int) -> Dict[str, int]:
-        scores = self.bm25.get_scores(tokenize(query))
-        ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)[:limit]
-        return {self.chunks[index]["chunk_id"]: rank for rank, (index, score) in enumerate(ranked, start=1) if score > 0}
+    def bm25_search(self, query: str, top_k: int = 5, *, expand: bool = True) -> List[Dict]:
+        """Return lexical BM25 matches with exact-keyword-friendly scores."""
+        search_query = expand_query(query) if expand else query
+        scores = self.bm25.get_scores(tokenize(search_query))
+        ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)[:top_k]
+        results = []
+        for rank, (index, score) in enumerate(ranked, start=1):
+            if score <= 0:
+                continue
+            chunk = self.chunks[index]
+            results.append({**chunk, "bm25_rank": rank, "bm25_score": float(score)})
+        return results
 
-    def vector_ranks(self, query: str, limit: int) -> Dict[str, int]:
+    def bm25_ranks(self, query: str, limit: int) -> Dict[str, int]:
+        return {row["chunk_id"]: row["bm25_rank"] for row in self.bm25_search(query, limit, expand=False)}
+
+    def semantic_search(self, query: str, top_k: int = 5) -> List[Dict]:
+        """Return dense semantic matches using cosine similarity on normalized embeddings."""
         embeddings = self.ensure_embeddings()
         query_vector = self.np.asarray(self.encode([query])[0], dtype="float32")
         scores = embeddings @ query_vector
-        ranked_indexes = scores.argsort()[::-1][:limit]
-        return {self.chunks[int(index)]["chunk_id"]: rank for rank, index in enumerate(ranked_indexes, start=1)}
+        ranked_indexes = scores.argsort()[::-1][:top_k]
+        results = []
+        for rank, index in enumerate(ranked_indexes, start=1):
+            chunk = self.chunks[int(index)]
+            results.append({
+                **chunk,
+                "vector_rank": rank,
+                "semantic_score": float(scores[int(index)]),
+            })
+        return results
+
+    def vector_ranks(self, query: str, limit: int) -> Dict[str, int]:
+        return {row["chunk_id"]: row["vector_rank"] for row in self.semantic_search(query, limit)}
 
     def retrieve(self, query: str, top_k: int = 4, *, candidate_k: int = 20, prune: bool = True) -> List[Dict]:
         expanded_query = expand_query(query)
