@@ -1,0 +1,15 @@
+{
+  "created_at": "2026-06-16",
+  "sources_in_catalog": 9,
+  "starter_documents": 21,
+  "starter_chunks": 21,
+  "qa_eval_cases": 20,
+  "sample_outputs": 6,
+  "known_limitation": "The packaged starter dataset contains verified official text snapshots. Full raw PDFs/HTML must be downloaded by running scripts/01_download_sources.py on a machine with internet access.",
+  "run_all_status": "passed",
+  "sample_evaluator_passed": "6/6",
+  "pytest_status": "2 passed",
+  "sources": 9,
+  "chunks": 21,
+  "eval_cases": 20
+}
