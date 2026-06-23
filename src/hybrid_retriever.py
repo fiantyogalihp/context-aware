@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from src.parser import read_jsonl
 
@@ -259,19 +259,52 @@ class HybridRetriever:
     def vector_ranks(self, query: str, limit: int) -> Dict[str, int]:
         return {row["chunk_id"]: row["vector_rank"] for row in self.semantic_search(query, limit)}
 
-    def retrieve(self, query: str, top_k: int = 4, *, candidate_k: int = 20, prune: bool = True) -> List[Dict]:
+    def retrieve(
+        self, 
+        query: str, 
+        top_k: int = 4, 
+        *, 
+        candidate_k: int = 20, 
+        prune: bool = True,
+        filter_chunk_types: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        Retrieve relevant chunks with optional chunk type filtering.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to return
+            candidate_k: Number of candidates for RRF fusion
+            prune: Whether to apply context pruning
+            filter_chunk_types: Optional list of chunk types to filter (e.g., ["table"], ["text"])
+        
+        Returns:
+            List of retrieved chunks with ranking metadata
+        """
         expanded_query = expand_query(query)
         bm25 = self.bm25_ranks(expanded_query, candidate_k)
         vector = self.vector_ranks(expanded_query, candidate_k)
         fused = reciprocal_rank_fusion([bm25, vector])
-        ranked_ids = sorted(fused, key=fused.get, reverse=True)[:top_k]
+        ranked_ids = sorted(fused, key=fused.get, reverse=True)
+        
         results = []
         for chunk_id in ranked_ids:
+            if len(results) >= top_k:
+                break
+                
             chunk = self.by_id[chunk_id]
+            
+            # Filter by chunk type if specified
+            if filter_chunk_types is not None:
+                chunk_type = chunk.get("chunk_type") or chunk.get("metadata", {}).get("chunk_type")
+                if chunk_type not in filter_chunk_types:
+                    continue
+            
             results.append({
                 **chunk,
                 "bm25_rank": bm25.get(chunk_id),
                 "vector_rank": vector.get(chunk_id),
                 "rrf_score": round(fused[chunk_id], 6),
             })
+        
         return prune_context(results) if prune else results

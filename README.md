@@ -35,13 +35,51 @@ ACCEPT / REVIEW / REJECT + reports/*
 - `src/parser.py` memakai `pdfplumber` sebagai parser utama PDF, lalu memisahkan teks biasa dan tabel agar relasi kolom tetap utuh.
 - `scripts/03_chunk_hierarchy.py` membangun chunk hierarkis ke `dataset/processed/chunks.jsonl` dan `dataset/processed/chunks_rebuilt.jsonl`.
 
-### 2. Retrieval
+### 2. Query Routing dan Retrieval
 
-- `src/hybrid_retriever.py` menggabungkan:
+#### Query Router (`src/query_router.py`)
+
+- Klasifikasi intent query secara deterministik menggunakan regex patterns.
+- Dua intent utama:
+  - **COMPUTATIONAL**: Query yang memerlukan agregasi, perbandingan, atau komputasi (contoh: "Berapa total vaksin?", "Bandingkan BPJS PBI dan Non-PBI")
+  - **FACTUAL**: Query yang mencari informasi prosedural atau deskriptif (contoh: "Apa syarat pendaftaran?", "Bagaimana cara mengubah faskes?")
+- Output routing mencakup:
+  - Intent classification dengan confidence score
+  - Processing path recommendation
+  - Suggested chunk types untuk filtering (table-only untuk computational, mixed untuk factual)
+
+#### Hybrid Retriever (`src/hybrid_retriever.py`)
+
+- Menggabungkan:
   - BM25 (`rank_bm25`) untuk pencocokan kata kunci/istilah eksak,
   - embedding semantik (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`),
   - Reciprocal Rank Fusion untuk gabung peringkat.
+- Mendukung filtering berdasarkan chunk type (`filter_chunk_types` parameter).
 - Hasil retrieval dipangkas oleh `prune_context()` agar konteks tidak berisi duplikasi dan noise layout.
+
+**Contoh Penggunaan Query Router:**
+
+```python
+from src.query_router import QueryRouter
+from src.hybrid_retriever import HybridRetriever
+
+router = QueryRouter()
+retriever = HybridRetriever.from_jsonl("dataset/processed/chunks.jsonl")
+
+# Route query
+query = "Berapa total vaksin yang diperlukan?"
+routing = router.route_query(query)
+
+# Retrieve dengan filtering
+if routing["processing_path"] == "computational":
+    contexts = retriever.retrieve(
+        query, 
+        top_k=4,
+        filter_chunk_types=["table"]  # Prioritas tabel untuk komputasi
+    )
+else:
+    contexts = retriever.retrieve(query, top_k=4)
+```
 
 ### 3. Generation
 
@@ -60,11 +98,20 @@ ACCEPT / REVIEW / REJECT + reports/*
 
 ## Struktur Repo
 
-- `src/`: parser, retriever, generator, evaluator.
+- `src/`: parser, retriever, generator, evaluator, query router.
+  - `parser.py`: Ekstraksi PDF/HTML dengan table-aware parsing
+  - `hybrid_retriever.py`: BM25 + dense embeddings + RRF dengan chunk type filtering
+  - `query_router.py`: Intent-based query classification (computational vs factual)
+  - `generator.py`: Xiaomi Mimo 2.5 wrapper dengan breadcrumb injection dan JSON structured output
+  - `evaluator.py`: Deterministic scoring (attribution, specificity, context quality)
 - `scripts/`: pipeline download, ekstraksi, chunking, evaluasi, verifikasi.
 - `dataset/`: katalog sumber, raw files, dokumen terproses, eval set.
 - `reports/`: hasil evaluasi dan ringkasan paket.
 - `tests/`: test offline deterministik.
+  - `test_query_router.py`: 22 tests untuk query routing
+  - `test_breadcrumb_injection.py`: 5 tests untuk breadcrumb injection
+  - `test_json_structured_output.py`: 8 tests untuk JSON structured output
+- `examples/`: contoh penggunaan query router dan integrasi komponen
 - `run_all.py`: runner cepat untuk path starter/offline.
 
 ## Format Data
@@ -139,9 +186,69 @@ export MIMO_MODEL="mimo-v2.5-pro"
 - Jawaban medis individual, dosis, dan diagnosis tetap harus ditolak oleh hard-fail rules.
 - Saat mengubah parser atau retriever, pertahankan schema JSONL agar evaluasi dan pipeline tidak pecah.
 
+## Fitur Lanjutan
+
+### 1. Hierarchy-Preserving Table Parser
+
+Sudah terimplementasi di `src/parser.py`:
+- Ekstraksi tabel dengan `pdfplumber` yang menjaga struktur kolom
+- Konversi ke format Markdown untuk readability
+- Metadata lengkap (page, section, chunk_type)
+- Chunk ID hierarkis dengan format `DOC_SECTION_SUBSECTION_###`
+
+### 2. Intent-Based Query Router
+
+Terimplementasi di `src/query_router.py`:
+- Klasifikasi deterministik menggunakan regex patterns
+- Dua intent: COMPUTATIONAL (agregasi/komputasi) dan FACTUAL (prosedural/deskriptif)
+- Confidence scoring untuk setiap pattern match
+- Integrasi dengan `HybridRetriever` untuk chunk type filtering
+- 22 unit tests dengan coverage lengkap
+
+**Query Classification Examples:**
+
+```python
+# Computational queries → filter ke table chunks
+"Berapa total vaksin yang diperlukan?"
+"Bandingkan BPJS PBI dan Non-PBI"
+"Hitung rata-rata biaya persalinan"
+
+# Factual queries → allow text + table chunks
+"Apa syarat pendaftaran BPJS?"
+"Bagaimana cara mengubah faskes?"
+"Kapan jadwal imunisasi BCG?"
+```
+
+### 3. Breadcrumb Injection
+
+Terimplementasi di `src/generator.py`:
+- Injeksi hierarchy path ke setiap chunk context
+- Format: `[Source > Section > Subsection]`
+- Membantu LLM memahami struktur dokumen
+- 5 unit tests untuk validasi
+
+### 4. JSON Structured Output
+
+Terimplementasi di `src/generator.py`:
+- Memaksa LLM ekstrak exact quotes sebelum generate answer
+- Format output terstruktur dengan `exact_quotes` dan `answer`
+- Mengurangi hallucination dengan grounding eksplisit
+- 8 unit tests untuk validasi
+
 ## Pengembangan
 
 - Gunakan 4 spasi dan `snake_case`.
 - Tambahkan test offline di `tests/test_*.py` untuk perubahan parser, retriever, atau evaluator.
 - Hindari manual edit pada `dataset/raw/` kecuali sedang kurasi sumber.
 - Simpan hasil eksperimen ke `reports/`, bukan ke file sumber.
+- Jalankan `venv/bin/python -m pytest -q` untuk memastikan semua tests passing sebelum commit.
+
+## Test Coverage
+
+Total: **43 tests** (semua passing)
+- Query Router: 22 tests
+- Breadcrumb Injection: 5 tests
+- JSON Structured Output: 8 tests
+- Evaluator: 3 tests
+- Retriever Filter: 3 tests
+- Integration: 2 tests
