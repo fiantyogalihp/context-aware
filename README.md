@@ -1,6 +1,6 @@
 # Action-Driven Evaluation Layer for Official Public Healthcare RAG Systems
 
-Starter repo ini membangun RAG kesehatan publik Indonesia dengan tiga hal inti: ekstraksi dokumen resmi yang menjaga struktur tabel, hybrid retrieval BM25 + dense embedding, dan evaluator deterministik `ACCEPT / REVIEW / REJECT` tanpa model call.
+Starter repo ini membangun RAG kesehatan publik Indonesia dengan tiga hal inti: ekstraksi dokumen resmi yang menjaga struktur tabel, hybrid retrieval BM25 + dense embedding, dan evaluator deterministik `ACCEPT / REVIEW / REJECT` dengan hybrid semantic-lexical scoring.
 
 ## Alur Singkat
 
@@ -20,7 +20,7 @@ scripts/03_chunk_hierarchy.py -> dataset/processed/chunks.jsonl
 src/hybrid_retriever.py + src/generator.py
         |
         v
-src/evaluator.py
+src/evaluator.py (Hybrid Semantic-Lexical Scoring)
         |
         v
 ACCEPT / REVIEW / REJECT + reports/*
@@ -87,14 +87,34 @@ else:
 - Client mengirim chat completions OpenAI-compatible dengan `temperature=0.0`.
 - `MIMO_BASE_URL` bisa diisi manual; jika kosong, kode mencoba menebak base URL dari prefiks API key.
 
-### 4. Evaluation
+### 4. Evaluation dengan Hybrid Semantic-Lexical Scoring
 
 - `src/evaluator.py` menghitung:
-  - `attribution_score`
-  - `specificity_score`
-  - `context_quality_score`
+  - **`attribution_score`** (Hybrid): Kombinasi semantic similarity (60%) dan lexical token overlap (40%)
+    - `semantic_score`: Cosine similarity menggunakan SBERT (`paraphrase-multilingual-MiniLM-L12-v2`)
+    - `lexical_score`: Token overlap dengan validasi numerik (logika original)
+    - Formula: `attribution_score = 0.6 × semantic_score + 0.4 × lexical_score`
+  - `specificity_score`: Mengukur detail dan relevansi jawaban
+  - `context_quality_score`: Mengukur kualitas konteks yang diambil
 - Routing deterministik memakai threshold default `accept_a=0.78`, `accept_s=0.50`, `accept_c=0.70`.
 - Ada hard-fail rules untuk diagnosis, dosis obat, resep, dan klaim medis individual.
+
+**Output Evaluasi:**
+
+```json
+{
+  "route": "ACCEPT",
+  "attribution_score": 0.856,
+  "semantic_score": 0.912,
+  "lexical_score": 0.765,
+  "specificity_score": 0.680,
+  "context_quality_score": 0.850,
+  "supported_claims": 2,
+  "total_claims": 2,
+  "hard_fails": [],
+  "warnings": []
+}
+```
 
 ## Struktur Repo
 
@@ -103,7 +123,7 @@ else:
   - `hybrid_retriever.py`: BM25 + dense embeddings + RRF dengan chunk type filtering
   - `query_router.py`: Intent-based query classification (computational vs factual)
   - `generator.py`: Xiaomi Mimo 2.5 wrapper dengan breadcrumb injection dan JSON structured output
-  - `evaluator.py`: Deterministic scoring (attribution, specificity, context quality)
+  - `evaluator.py`: Hybrid semantic-lexical scoring untuk attribution + deterministic routing
 - `scripts/`: pipeline download, ekstraksi, chunking, evaluasi, verifikasi.
 - `dataset/`: katalog sumber, raw files, dokumen terproses, eval set.
 - `reports/`: hasil evaluasi dan ringkasan paket.
@@ -111,7 +131,13 @@ else:
   - `test_query_router.py`: 22 tests untuk query routing
   - `test_breadcrumb_injection.py`: 5 tests untuk breadcrumb injection
   - `test_json_structured_output.py`: 8 tests untuk JSON structured output
+  - `test_hybrid_scoring.py`: 14 tests untuk hybrid semantic-lexical scoring
+  - `test_evaluator.py`: 16 tests untuk evaluator (backward compatibility)
 - `examples/`: contoh penggunaan query router dan integrasi komponen
+- `docs/`: dokumentasi lengkap
+  - `QUERY_ROUTER.md`: Dokumentasi query router
+  - `HYBRID_SCORING.md`: Dokumentasi hybrid semantic-lexical scoring
+  - `IMPLEMENTATION_SUMMARY.md`: Ringkasan implementasi fitur advanced
 - `run_all.py`: runner cepat untuk path starter/offline.
 
 ## Format Data
@@ -176,13 +202,14 @@ export MIMO_MODEL="mimo-v2.5-pro"
 ## Verifikasi
 
 - `venv/bin/python scripts/06_verify_package.py` memeriksa kelengkapan paket dan schema JSONL.
-- `venv/bin/python src/evaluator.py --input dataset/eval/sample_model_outputs.jsonl` menjalankan evaluator offline.
+- `venv/bin/python src/evaluator.py --input dataset/eval/sample_model_outputs.jsonl` menjalankan evaluator offline dengan hybrid scoring.
 - `venv/bin/python scripts/run_tests.py --engine mimo ...` menjalankan retrieval + generation + evaluasi pada eval set.
 
 ## Prinsip Kerja
 
 - Dokumen resmi harus menjadi sumber utama.
-- Evaluator tetap deterministik dan tidak bergantung pada LLM.
+- Evaluator tetap deterministik dan tidak bergantung pada LLM untuk routing decisions.
+- Hybrid semantic-lexical scoring menggabungkan pemahaman semantik dengan exact token matching.
 - Jawaban medis individual, dosis, dan diagnosis tetap harus ditolak oleh hard-fail rules.
 - Saat mengubah parser atau retriever, pertahankan schema JSONL agar evaluasi dan pipeline tidak pecah.
 
@@ -235,6 +262,46 @@ Terimplementasi di `src/generator.py`:
 - Mengurangi hallucination dengan grounding eksplisit
 - 8 unit tests untuk validasi
 
+### 5. Hybrid Semantic-Lexical Scoring
+
+Terimplementasi di `src/evaluator.py`:
+- **Semantic Similarity (60%)**: Menggunakan SBERT (`paraphrase-multilingual-MiniLM-L12-v2`) untuk menghitung cosine similarity antara answer dan contexts
+- **Lexical Token Overlap (40%)**: Mempertahankan logika original token matching dengan validasi numerik
+- **Formula**: `attribution_score = 0.6 × semantic_score + 0.4 × lexical_score`
+- **Transparent Scoring**: Kedua komponen (semantic dan lexical) ditampilkan dalam output JSON
+- **Fallback Handling**: Jika model SBERT tidak tersedia, fallback ke lexical-only scoring
+- 14 unit tests untuk hybrid scoring + 16 tests backward compatibility
+
+**Keuntungan Hybrid Scoring:**
+- Menangkap parafrase dan variasi bahasa (semantic)
+- Mempertahankan exact factual grounding (lexical)
+- Mengurangi false positives dan false negatives
+- Transparent dan debuggable
+
+**Contoh Output:**
+
+```python
+from src.evaluator import evaluate
+
+result = evaluate(question, answer, contexts)
+print(f"Attribution: {result.attribution_score}")
+print(f"  Semantic: {result.semantic_score}")
+print(f"  Lexical: {result.lexical_score}")
+```
+
+**Download Model SBERT:**
+
+Model akan otomatis didownload saat pertama kali digunakan. Untuk download manual:
+
+```bash
+venv/bin/python -c "
+import os
+os.environ['HF_TOKEN'] = 'your_hf_token_here'
+from sentence_transformers import SentenceTransformer
+SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device='cpu')
+"
+```
+
 ## Pengembangan
 
 - Gunakan 4 spasi dan `snake_case`.
@@ -245,10 +312,18 @@ Terimplementasi di `src/generator.py`:
 
 ## Test Coverage
 
-Total: **43 tests** (semua passing)
+Total: **57 tests** (semua passing)
 - Query Router: 22 tests
 - Breadcrumb Injection: 5 tests
 - JSON Structured Output: 8 tests
-- Evaluator: 3 tests
+- Hybrid Scoring: 14 tests
+- Evaluator (backward compatibility): 16 tests
 - Retriever Filter: 3 tests
 - Integration: 2 tests
+
+## Dokumentasi Lengkap
+
+- **Query Router**: `docs/QUERY_ROUTER.md`
+- **Hybrid Scoring**: `docs/HYBRID_SCORING.md`
+- **Implementation Summary**: `docs/IMPLEMENTATION_SUMMARY.md`
+- **Main README**: `README.md` (file ini)

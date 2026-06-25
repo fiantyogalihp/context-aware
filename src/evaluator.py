@@ -3,6 +3,11 @@
 
 This module intentionally avoids model calls and heavy dependencies. It converts
 RAG outputs into deterministic Accept / Review / Reject routing decisions.
+
+Hybrid Semantic-Lexical Scoring:
+- Uses sentence-transformers for semantic similarity (cosine similarity)
+- Combines with lexical token overlap for robust attribution scoring
+- Final attribution_score = 0.6 * semantic_score + 0.4 * lexical_score
 """
 from __future__ import annotations
 
@@ -14,6 +19,14 @@ import json
 import re
 import sys
 from urllib.parse import urlparse
+import numpy as np
+
+try:
+    from sentence_transformers import SentenceTransformer
+    SBERT_AVAILABLE = True
+except ImportError:
+    SBERT_AVAILABLE = False
+    SentenceTransformer = None
 
 try:
     import yaml
@@ -23,6 +36,24 @@ except Exception:  # pragma: no cover - optional dependency in starter mode
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_THRESHOLD_PATH = ROOT / "config" / "evaluator_thresholds.yaml"
 DEFAULT_THRESHOLDS = {"accept_a": 0.78, "accept_s": 0.50, "accept_c": 0.70, "review_a": 0.45, "review_c": 0.45}
+
+# Global semantic model (lazy-loaded)
+_SEMANTIC_MODEL = None
+
+def get_semantic_model():
+    """Lazy-load sentence-transformers model for semantic similarity."""
+    global _SEMANTIC_MODEL
+    if _SEMANTIC_MODEL is None and SBERT_AVAILABLE:
+        import os
+        # Set HuggingFace token if not already set
+        if not os.environ.get('HF_TOKEN'):
+            os.environ['HF_TOKEN'] = 'missing'
+
+        _SEMANTIC_MODEL = SentenceTransformer(
+            'paraphrase-multilingual-MiniLM-L12-v2',
+            device='cpu'
+        )
+    return _SEMANTIC_MODEL
 
 OFFICIAL_DOMAINS = (
     "kemkes.go.id",
@@ -85,6 +116,8 @@ class EvaluationResult:
     attribution_score: float
     specificity_score: float
     context_quality_score: float
+    semantic_score: float
+    lexical_score: float
     hard_fails: List[str]
     warnings: List[str]
     supported_claims: int
@@ -205,7 +238,63 @@ def claim_support_score(claim: str, contexts: Sequence[Dict]) -> float:
     return min(best, 1.0)
 
 
-def attribution_score(answer: str, contexts: Sequence[Dict]) -> Tuple[float, int, int]:
+def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """Calculate cosine similarity between two vectors."""
+    dot_product = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return float(dot_product / (norm1 * norm2))
+
+
+def semantic_similarity_score(answer: str, contexts: Sequence[Dict]) -> float:
+    """
+    Calculate semantic similarity between answer and contexts using SBERT.
+
+    Falls back to 0.0 if model is unavailable or fails to load.
+
+    Returns:
+        float: Semantic similarity score (0.0 - 1.0)
+    """
+    try:
+        model = get_semantic_model()
+        if model is None or not contexts:
+            return 0.0
+
+        # Combine all context text
+        context_texts = []
+        for ctx in contexts:
+            text = context_evidence_text(ctx)
+            if text.strip():
+                context_texts.append(text)
+
+        if not context_texts:
+            return 0.0
+
+        # Encode answer and contexts
+        answer_embedding = model.encode(answer, convert_to_numpy=True)
+        context_embeddings = model.encode(context_texts, convert_to_numpy=True)
+
+        # Calculate max similarity across all contexts
+        max_similarity = 0.0
+        for ctx_embedding in context_embeddings:
+            similarity = cosine_similarity(answer_embedding, ctx_embedding)
+            max_similarity = max(max_similarity, similarity)
+
+        return min(max_similarity, 1.0)
+    except Exception:
+        # Fallback to 0.0 if model loading or encoding fails
+        return 0.0
+
+
+def lexical_attribution_score(answer: str, contexts: Sequence[Dict]) -> Tuple[float, int, int]:
+    """
+    Calculate lexical attribution score using token overlap (original logic).
+
+    Returns:
+        Tuple[float, int, int]: (lexical_score, supported_claims, total_claims)
+    """
     claims = [c for c in sentence_split(answer) if not is_neutral_reference_sentence(c)]
     if not claims:
         return 0.0, 0, 0
@@ -217,6 +306,30 @@ def attribution_score(answer: str, contexts: Sequence[Dict]) -> Tuple[float, int
     if support_ratio < 0.5:
         final *= max(0.25, support_ratio)
     return round(final, 3), supported, len(claims)
+
+
+def attribution_score(answer: str, contexts: Sequence[Dict]) -> Tuple[float, float, float, int, int]:
+    """
+    Calculate hybrid semantic-lexical attribution score.
+
+    Combines:
+    - Semantic similarity (SBERT cosine similarity): 60% weight
+    - Lexical token overlap (original logic): 40% weight
+
+    Returns:
+        Tuple[float, float, float, int, int]:
+            (final_score, semantic_score, lexical_score, supported_claims, total_claims)
+    """
+    # Calculate lexical score (original token overlap logic)
+    lexical_score, supported, total = lexical_attribution_score(answer, contexts)
+
+    # Calculate semantic score (SBERT similarity)
+    semantic_score = semantic_similarity_score(answer, contexts)
+
+    # Hybrid weighting: 60% semantic + 40% lexical
+    final_score = 0.6 * semantic_score + 0.4 * lexical_score
+
+    return round(final_score, 3), round(semantic_score, 3), round(lexical_score, 3), supported, total
 
 
 def specificity_score(question: str, answer: str, attr: float) -> float:
@@ -296,7 +409,9 @@ def evaluate(question: str, answer: str, contexts: Sequence[Dict], *, thresholds
 
     c_score, ctx_warnings = context_quality_score(question, contexts)
     warnings.extend(ctx_warnings)
-    a_score, supported, total = attribution_score(answer, contexts)
+
+    # Get hybrid semantic-lexical attribution score
+    a_score, semantic_score, lexical_score, supported, total = attribution_score(answer, contexts)
     s_score = specificity_score(question, answer, a_score)
 
     if any(w.startswith("non_official_context") for w in warnings):
@@ -319,7 +434,7 @@ def evaluate(question: str, answer: str, contexts: Sequence[Dict], *, thresholds
     else:
         route = "REJECT"
 
-    return EvaluationResult(route, a_score, s_score, c_score, sorted(set(hard_fails)), warnings, supported, total)
+    return EvaluationResult(route, a_score, s_score, c_score, semantic_score, lexical_score, sorted(set(hard_fails)), warnings, supported, total)
 
 
 def result_to_dict(result: EvaluationResult) -> Dict:

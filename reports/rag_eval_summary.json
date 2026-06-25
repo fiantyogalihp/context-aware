@@ -14,8 +14,8 @@
     "REVIEW": 3
   },
   "metric_averages": {
-    "attribution_score": 0.593,
-    "specificity_score": 0.374,
+    "attribution_score": 0.625,
+    "specificity_score": 0.38,
     "context_quality_score": 0.846
   },
   "failed_question_ids": []

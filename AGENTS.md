@@ -2,13 +2,14 @@
 
 ## Project Structure & Module Organization
 
-This repository implements an offline-first public-health RAG starter with deterministic evaluation.
+This repository implements an offline-first public-health RAG starter with deterministic evaluation and hybrid semantic-lexical scoring.
 
 - `src/parser.py`: PDF/HTML extraction, table-aware parsing, chunk building, JSONL IO.
 - `src/hybrid_retriever.py`: BM25 + dense embeddings + RRF + context pruning.
 - `src/vector_retriever.py`: compatibility re-export for older imports.
-- `src/generator.py`: Xiaomi Mimo 2.5 wrapper for OpenAI-compatible chat completions.
-- `src/evaluator.py`: pure-Python attribution, specificity, context-quality scoring, and hard-fail rules.
+- `src/query_router.py`: Intent-based query classification (computational vs factual).
+- `src/generator.py`: Xiaomi Mimo 2.5 wrapper for OpenAI-compatible chat completions with breadcrumb injection and JSON structured output.
+- `src/evaluator.py`: Hybrid semantic-lexical attribution scoring (60% semantic + 40% lexical), specificity, context-quality scoring, and hard-fail rules.
 - `scripts/`: download, extraction, chunking, testing, verification, and pipeline orchestration.
 - `dataset/`: source catalog, raw inputs, extracted docs, processed chunks, eval sets.
 - `reports/`: generated evaluation traces and summaries.
@@ -22,7 +23,7 @@ Run from repo root. Use `venv/bin/python` if the shell has not activated the pro
 - `venv/bin/python run_all.py --download` downloads sources, then rebuilds extracted docs and chunks.
 - `venv/bin/python scripts/pipeline.py --download --extract --build-index --run-eval --engine mimo` runs the full end-to-end pipeline.
 - `venv/bin/python scripts/run_tests.py --engine mimo --eval-set dataset/eval/qa_eval.jsonl --output reports/rag_eval_results.jsonl --debug-output reports/rag_eval_debug.jsonl --summary-output reports/rag_eval_summary.json --skip-build-index` runs retrieval, generation, and evaluation with MiMo.
-- `venv/bin/python src/evaluator.py --input dataset/eval/sample_model_outputs.jsonl` runs the deterministic evaluator on the sample fixture.
+- `venv/bin/python src/evaluator.py --input dataset/eval/sample_model_outputs.jsonl` runs the deterministic evaluator with hybrid scoring on the sample fixture.
 - `venv/bin/python -m pytest -q` runs unit tests in the active environment.
 
 ## Coding Style & Naming Conventions
@@ -39,10 +40,11 @@ Run from repo root. Use `venv/bin/python` if the shell has not activated the pro
 - Favor fixture-based assertions using `dataset/processed/` and `dataset/eval/`.
 - Keep parser, retriever, and evaluator tests offline and reproducible.
 - When changing chunking or retrieval, verify both `chunks.jsonl` shape and evaluator routing.
+- Test hybrid scoring components separately (semantic, lexical) and combined.
 
 ## Commit & Pull Request Guidelines
 
-No commit history is exposed in this checkout, so use concise imperative subjects such as `Add table-aware parser`.
+No commit history is exposed in this checkout, so use concise imperative subjects such as `Add hybrid semantic-lexical scoring`.
 
 - Keep each commit focused on one logical change.
 - In PRs, describe the user-visible effect, note dataset regeneration, and list the commands you ran.
@@ -54,3 +56,26 @@ No commit history is exposed in this checkout, so use concise imperative subject
 - Keep `MIMO_API_KEY`, `MIMO_BASE_URL`, and `MIMO_MODEL` in local environment config only.
 - `MIMO_BASE_URL` must point to the OpenAI-compatible base URL, not `/chat/completions`.
 - Preserve evaluator hard-fail behavior for diagnosis, dosage, and other individual medical advice.
+- HuggingFace token for SBERT model downloads is configured in `src/evaluator.py` but can be overridden via `HF_TOKEN` environment variable.
+
+## Hybrid Semantic-Lexical Scoring
+
+The evaluator now uses hybrid scoring for attribution:
+
+- **Semantic Score (60%)**: SBERT-based cosine similarity between answer and contexts
+- **Lexical Score (40%)**: Token overlap with numeric validation (original logic)
+- **Formula**: `attribution_score = 0.6 × semantic_score + 0.4 × lexical_score`
+
+Both components are transparent in evaluation output:
+
+```json
+{
+  "attribution_score": 0.856,
+  "semantic_score": 0.912,
+  "lexical_score": 0.765
+}
+```
+
+Model: `paraphrase-multilingual-MiniLM-L12-v2` (471MB, auto-downloaded on first use)
+
+See `docs/HYBRID_SCORING.md` for detailed documentation.
